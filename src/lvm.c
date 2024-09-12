@@ -5,6 +5,9 @@
 #include <stdint.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/eventfd.h>
 #include <linux/kvm.h>
 #include <sys/mman.h>
 #include <string.h>
@@ -48,8 +51,8 @@ static struct elf_vm_info load_elf(char *fname, int vmfd)
 		struct elf64_segment_hdr *sh = program->segment_headers[i];
 		if (sh->p_type != 0x01)
 			continue;
-		printf("Reading %lx bytes from %lx offset into the memory at addr %lx\n", sh->p_filesz, sh->p_offset, sh->p_vaddr);
-		pages_count = (sh->p_filesz + PAGE_SIZE - 1) / PAGE_SIZE;
+		printf("Reading %lx bytes from %lx offset into the memory at addr %lx\n", sh->p_memsz, sh->p_offset, sh->p_vaddr);
+		pages_count = (sh->p_memsz + PAGE_SIZE - 1) / PAGE_SIZE;
 		mem = alloc_pages_from_mpt(pages_count);
 		map_range(sh->p_vaddr, mem.guest, pages_count);
 		read_from_file((void *)mem.host, fname, sh->p_offset, sh->p_filesz);
@@ -118,6 +121,9 @@ static int vm_cycle(int kvm, int vcpufd)
 		case KVM_EXIT_HLT:
 			printf("KVM_EXIT_HLT\n");
 			return 0;
+		//case KVM_EXIT_DEBUG:
+		//	printf("DEBUGG!\n");
+			//break;
 		case KVM_EXIT_IO:
 			if (run->io.direction == KVM_EXIT_IO_OUT
 			    && run->io.port == 0x3f8)
@@ -147,12 +153,29 @@ static int vm_cycle(int kvm, int vcpufd)
 	return 0;
 }
 
+static volatile int irqfd;
+static void *inject_irq(void *data)
+{
+	int res;
+	uint64_t val = 1;
+
+	sleep(2);
+	printf("Injecting irq...\n");
+
+	res = eventfd_write(irqfd, val);
+
+	close(irqfd);
+	return NULL;
+}
+
 static int start_vm(char *fname)
 {
 	int kvm, vmfd, vcpufd;
 	struct elf_vm_info info;
+	pthread_t it;
 	int ret;
 	uint64_t stack_addr;
+
 
 	kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
 
@@ -167,8 +190,23 @@ static int start_vm(char *fname)
 	}
 
 	vmfd = ioctl(kvm, KVM_CREATE_VM, (unsigned long)0);
+	ret = ioctl(vmfd, KVM_CREATE_IRQCHIP, NULL);
+	if (ret < 0) {
+		printf("Can't create irq chip: %d %d\n", ret, errno);
+		return ret;
+	}
+
 	vcpufd = ioctl(vmfd, KVM_CREATE_VCPU, (unsigned long)0);
 	init_page_tables(vmfd);
+
+	/*struct kvm_guest_debug dbg = {
+		.control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP,
+	};
+	ret = ioctl(vcpufd, KVM_SET_GUEST_DEBUG, &dbg);
+	if (ret < 0) {
+		printf("Can't set debug struct\n");
+		return ret;
+	}*/
 
 	ret = setup_sregs(vcpufd, vmfd);
 	if (ret)
@@ -177,6 +215,7 @@ static int start_vm(char *fname)
 	info = load_elf(fname, vmfd);
 	stack_addr = alloc_stack();
 	init_hypercalls_page(0x2000);
+	map_addr(0xDEAD000, 0xDEAD000);
 	print_page_mapping();
 	printf("Starting ELF at 0x%lx...\n", info.start_addr);
 
@@ -184,7 +223,35 @@ static int start_vm(char *fname)
 	if (ret)
 		return ret;
 
+	struct kvm_irqfd irqfd_s = {
+		.gsi = 12,
+	};
+
+	irqfd = eventfd(0, 0);
+	irqfd_s.fd = irqfd;
+	printf("IRQFD eventfd: %d\n", irqfd);	
+
+	ret = ioctl(vmfd, KVM_IRQFD, &irqfd_s);
+	if (ret < 0) {
+		printf("Can't create an irqfd: %d %d\n", ret, errno);
+		return ret;
+	}
+
+/*	static struct kvm_userspace_memory_region mmio_region = {};
+
+	mmio_region.slot = 2;
+	mmio_region.guest_phys_addr = 0xDEAD000ULL;
+	mmio_region.memory_size = PAGE_SIZE;
+
+	ret = ioctl(vmfd, KVM_SET_USER_MEMORY_REGION, &mmio_region);
+	if (ret) {
+		printf("Failed to create region for page tables\n");
+		return -1;
+	}*/
+
+	pthread_create(&it, NULL, inject_irq, NULL);
 	ret = vm_cycle(kvm, vcpufd);
+	pthread_join(it, NULL);
 clean:
 	close(kvm);
 	return ret;
